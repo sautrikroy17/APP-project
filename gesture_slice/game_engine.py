@@ -271,7 +271,18 @@ class Game:
         self.pending = still_waiting
 
     def launch_parameters(self, radius):
-        """Start position and velocity of a throw that peaks inside the screen."""
+        """
+        Calculates kinematic launch parameters for a natural parabolic trajectory.
+
+        Kinematics Formula:
+        1. Desired apex (peak height) is chosen randomly in the top 12% - 42% of the screen.
+        2. Vertical launch velocity via Torricelli's equation:
+               v_y^2 = 2 * g * delta_y  ==>  v_y = -sqrt(2 * g * (y0 - apex_y))
+        3. Flight time to peak and back down:
+               t_flight = 2 * (-v_y) / g
+        4. Horizontal velocity to steer projectile toward the central screen area:
+               v_x = (target_x - x0) / t_flight * variation
+        """
         s = self.level_settings
         g = config.GRAVITY * s.speed ** 2
         w, h = self.width, self.height
@@ -295,9 +306,17 @@ class Game:
             self.stats.fruits_spawned += 1
 
     def _collide(self, segments, events):
+        """
+        Detects collisions between input swipe segments and active entities.
+        - Filters out slow movements (< slice_speed) so delicate cursor aiming
+          does not trigger accidental cuts.
+        - Splits hit fruits into two FruitHalf entities along the cutting angle.
+        - Calculates combo chains and awards bonus points for multi-fruit slices.
+        - Triggers bomb explosions and temporary invulnerability frames if a bomb is hit.
+        """
         for ax, ay, bx, by, speed in segments:
             if speed < self.slice_speed:
-                continue                       # slow movement only aims, it does not cut
+                continue                       # Slow movement only aims, does not slice
             angle = math.degrees(math.atan2(by - ay, bx - ax))
             for fruit in self.fruits:
                 if fruit.alive and fruit.hit_by(ax, ay, bx, by):

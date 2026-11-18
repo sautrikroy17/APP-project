@@ -125,19 +125,29 @@ class DatabaseManager:
 
     # ----------------------------------------------------------------- sessions
     def record_session(self, player_name, stats, control_mode):
-        """Store a finished game and update high score + statistics.
+        """
+        Persists a finished game session across multiple relational tables atomically.
 
-        ``stats`` is a game_engine.GameStats.  Returns a dict with the
-        player's best score, the global best and whether this is a new record.
-        Everything happens in one transaction: either all tables are updated
-        or none are.
+        ACID Transaction Guarantee:
+        - Wrapped in `with self.conn:` context manager.
+        - If any insert fails, the entire transaction is rolled back, preventing
+          corrupted partial state across players, game_sessions, and high_scores.
+
+        SQLite UPSERT Mechanics:
+        - `INSERT INTO high_scores ... ON CONFLICT(player_id) DO UPDATE ...`
+          ensures high_scores is updated ONLY IF the new score is strictly greater
+          (`WHERE excluded.best_score > high_scores.best_score`).
+        - `game_statistics` table automatically aggregates running totals (games_played,
+          total_score, max combo) using SQLite expressions.
         """
         try:
-            with self.conn:  # commits on success, rolls back on error
+            with self.conn:  # Context manager: commits on completion, rolls back on exception
                 player_name = self.clean_name(player_name)
                 player_id = self.get_or_create_player(player_name, commit=False)
                 previous_best = self.get_player_best(player_name)
                 now = _now()
+
+                # 1. Insert granular round history row
                 cur = self.conn.execute(
                     """INSERT INTO game_sessions
                        (player_id, score, fruits_sliced, fruits_missed, bombs_hit,
@@ -148,7 +158,7 @@ class DatabaseManager:
                      round(stats.elapsed, 2), control_mode, now))
                 session_id = cur.lastrowid
 
-                # UPSERT: insert the first high score or raise the existing one.
+                # 2. Atomic UPSERT: update high_scores only when new score beats old record
                 self.conn.execute(
                     """INSERT INTO high_scores (player_id, best_score, session_id, achieved_at)
                        VALUES (?, ?, ?, ?)
@@ -159,6 +169,7 @@ class DatabaseManager:
                        WHERE excluded.best_score > high_scores.best_score""",
                     (player_id, stats.score, session_id, now))
 
+                # 3. Atomic UPSERT: aggregate lifetime statistics
                 self.conn.execute(
                     """INSERT INTO game_statistics
                        (player_id, games_played, total_score, total_fruits_sliced,
@@ -190,6 +201,7 @@ class DatabaseManager:
 
     # ------------------------------------------------------------------ queries
     def get_player_best(self, player_name):
+        """Fetches personal best score using a JOIN across high_scores and players."""
         row = self.conn.execute(
             """SELECT h.best_score FROM high_scores h
                JOIN players p ON p.id = h.player_id WHERE p.name = ?""",
@@ -197,10 +209,21 @@ class DatabaseManager:
         return row["best_score"] if row else 0
 
     def get_global_best(self):
+        """Returns the highest score recorded across all players."""
         row = self.conn.execute("SELECT MAX(best_score) AS best FROM high_scores").fetchone()
         return row["best"] or 0
 
     def get_leaderboard(self, limit=10):
+        """
+        Generates the Top N Leaderboard via a 3-table relational JOIN.
+        SQL Query:
+            SELECT p.name, h.best_score, h.achieved_at, s.games_played, ...
+            FROM high_scores h
+            JOIN players p          ON p.id = h.player_id
+            JOIN game_statistics s  ON s.player_id = h.player_id
+            ORDER BY h.best_score DESC, h.achieved_at ASC
+            LIMIT ?
+        """
         rows = self.conn.execute(
             """SELECT p.name, h.best_score, h.achieved_at,
                       s.games_played, s.total_fruits_sliced, s.best_combo, s.best_accuracy
